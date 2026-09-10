@@ -3,12 +3,14 @@ package merkle
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -96,9 +98,19 @@ func (c *corruptLeaf) Write(p []byte) (int, error) {
 
 // syncOnce runs one Serve/Pull session over a fresh pipe pair and
 // reports the synced index, the total bytes transferred in both
-// directions, and the first error from either side.
-func syncOnce(t *testing.T, srv *Index, dst *memSink, prior *Index, corrupt bool) (*Index, int64, error) {
+// directions, and the first error from either side. All indices are
+// closed when the test ends.
+func syncOnce(t *testing.T, srv *Index, dst Sink, prior *Index, corrupt bool) (*Index, int64, error) {
 	t.Helper()
+	seen := map[*Index]bool{}
+	closeIdx := func(ix *Index) {
+		if ix != nil && !seen[ix] {
+			seen[ix] = true
+			t.Cleanup(func() { ix.Close() })
+		}
+	}
+	closeIdx(srv)
+	closeIdx(prior)
 	a, b := newPair()
 	var wire int64
 	origRead, origWrite := a.read, a.write
@@ -131,6 +143,7 @@ func syncOnce(t *testing.T, srv *Index, dst *memSink, prior *Index, corrupt bool
 	if err == nil {
 		err = serr
 	}
+	closeIdx(got)
 	return got, wire, err
 }
 
@@ -142,12 +155,55 @@ func pattern(n int) []byte {
 	return b
 }
 
+// virtualFile serves deterministic content — pattern() over its whole
+// range — with O(1) memory, for terabyte-scale tests. read counts the
+// bytes handed out so tests can assert on file I/O.
+type virtualFile struct {
+	size int64
+	read int64
+}
+
+func (v *virtualFile) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, errors.New("virtualFile: negative offset")
+	}
+	if off >= v.size {
+		return 0, io.EOF
+	}
+	end := int64(len(p))
+	if off+end > v.size {
+		end = v.size - off
+	}
+	for i := int64(0); i < end; i++ {
+		p[i] = byte((off + i) % 251)
+	}
+	v.read += end
+	return int(end), nil
+}
+
+// flippedFile is a virtualFile with one chunk's bytes XORed, standing
+// in for a file with a single changed chunk.
+type flippedFile struct {
+	virtualFile
+	lo, hi int64
+}
+
+func (f *flippedFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := f.virtualFile.ReadAt(p, off)
+	for i := 0; i < n; i++ {
+		if off+int64(i) >= f.lo && off+int64(i) < f.hi {
+			p[i] ^= 0x5A
+		}
+	}
+	return n, err
+}
+
 func TestIndexDeterministic(t *testing.T) {
-	a, err := NewIndex(bytes.NewBufferString("hello world"))
+	a, err := NewIndex(bytes.NewReader([]byte("hello world")), 11)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := NewIndex(bytes.NewBufferString("hello world"))
+	b, err := NewIndex(bytes.NewReader([]byte("hello world")), 11)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,11 +216,11 @@ func TestIndexDeterministic(t *testing.T) {
 	if a.Size() != 11 {
 		t.Fatalf("size = %d, want 11", a.Size())
 	}
-	c, _ := NewIndex(bytes.NewBufferString("hello worle"))
+	c, _ := NewIndex(bytes.NewReader([]byte("hello worle")), 11)
 	if a.Root() == c.Root() {
 		t.Fatal("different content, same root")
 	}
-	e, err := NewIndex(bytes.NewReader(nil))
+	e, err := NewIndex(bytes.NewReader(nil), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,9 +232,92 @@ func TestIndexDeterministic(t *testing.T) {
 	}
 }
 
+// TestIndexLazyConstruction pins AC3: NewIndex performs no I/O and
+// holds no file data; the first Root hashes the file exactly once, the
+// second is a memo hit.
+func TestIndexLazyConstruction(t *testing.T) {
+	const size = int64(1) << 30 // 1 GiB
+	v := &virtualFile{size: size}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ix, err := NewIndex(v, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ix.Close() })
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if v.read != 0 {
+		t.Fatalf("NewIndex read %d bytes, want 0", v.read)
+	}
+	if d := after.HeapAlloc - before.HeapAlloc; d >= 1<<20 {
+		t.Fatalf("constructing a 1 GiB index grew the heap by %d bytes, want < 1 MiB", d)
+	}
+	r1 := ix.Root()
+	if r1 == (Hash{}) {
+		t.Fatal("non-empty file with zero root")
+	}
+	if v.read != size {
+		t.Fatalf("first Root read %d bytes, want %d (the whole file, once)", v.read, size)
+	}
+	if r2 := ix.Root(); r2 != r1 {
+		t.Fatal("root changed on the second call")
+	}
+	if v.read != size {
+		t.Fatalf("second Root read %d more bytes, want 0 (memo hit)", v.read-size)
+	}
+}
+
+// TestSyncDeltaGiant pins AC4 at 1 GiB: the server reads its file once
+// to build the memo plus exactly the one changed chunk; the client
+// reads its file once for the memo build and nothing else; the wire
+// carries one chunk plus small descent overhead.
+func TestSyncDeltaGiant(t *testing.T) {
+	const size = int64(1) << 30
+	lo := int64(512 << 20) // one chunk, in the middle
+	old := &virtualFile{size: size}
+	nw := &flippedFile{virtualFile: virtualFile{size: size}, lo: lo, hi: lo + chunkSize}
+
+	dst, err := os.CreateTemp("", "merkle-giant-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dst.Close(); os.Remove(dst.Name()) })
+	if err := writeFileFrom(dst, &virtualFile{size: size}, size); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewIndex(nw, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, err := NewIndex(old, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, wire, err := syncOnce(t, srv, dst, prior, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire >= 2*chunkSize {
+		t.Fatalf("delta sync transferred %d bytes, want < %d (two chunks)", wire, 2*chunkSize)
+	}
+	if got.Root() != srv.Root() {
+		t.Fatal("synced root differs from the server's")
+	}
+	if nw.read != size+chunkSize {
+		t.Fatalf("server read %d bytes, want %d (one memo build + the changed chunk)", nw.read, size+chunkSize)
+	}
+	if old.read != size {
+		t.Fatalf("client read %d bytes, want %d (one memo build, nothing else)", old.read, size)
+	}
+	compareFileWith(t, dst, nw, size)
+}
+
 func TestSyncNoOp(t *testing.T) {
 	data := pattern(3 * chunkSize)
-	ix, err := NewIndex(bytes.NewReader(data))
+	ix, err := NewIndex(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,11 +345,11 @@ func TestSyncDelta(t *testing.T) {
 	for i := 50 * chunkSize; i < 51*chunkSize; i++ {
 		nw[i] ^= 0x5A
 	}
-	srv, err := NewIndex(bytes.NewReader(nw))
+	srv, err := NewIndex(bytes.NewReader(nw), int64(len(nw)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	prior, err := NewIndex(bytes.NewReader(old))
+	prior, err := NewIndex(bytes.NewReader(old), int64(len(old)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +371,7 @@ func TestSyncDelta(t *testing.T) {
 
 func TestSyncFromScratch(t *testing.T) {
 	data := pattern(3 * chunkSize)
-	srv, err := NewIndex(bytes.NewReader(data))
+	srv, err := NewIndex(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +394,7 @@ func TestSyncFromScratch(t *testing.T) {
 
 func TestSyncCorruption(t *testing.T) {
 	data := pattern(2 * chunkSize)
-	srv, err := NewIndex(bytes.NewReader(data))
+	srv, err := NewIndex(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,10 +408,10 @@ func TestSyncCorruption(t *testing.T) {
 func TestSyncShrinkAndGrow(t *testing.T) {
 	small := pattern(chunkSize)
 	big := pattern(3 * chunkSize)
-	smallIx, _ := NewIndex(bytes.NewReader(small))
-	bigIx, _ := NewIndex(bytes.NewReader(big))
 
 	t.Run("shrink", func(t *testing.T) {
+		smallIx, _ := NewIndex(bytes.NewReader(small), int64(len(small)))
+		bigIx, _ := NewIndex(bytes.NewReader(big), int64(len(big)))
 		sink := &memSink{data: append([]byte(nil), big...)}
 		got, _, err := syncOnce(t, smallIx, sink, bigIx, false)
 		if err != nil {
@@ -286,6 +425,8 @@ func TestSyncShrinkAndGrow(t *testing.T) {
 		}
 	})
 	t.Run("grow", func(t *testing.T) {
+		smallIx, _ := NewIndex(bytes.NewReader(small), int64(len(small)))
+		bigIx, _ := NewIndex(bytes.NewReader(big), int64(len(big)))
 		sink := &memSink{data: append([]byte(nil), small...)}
 		got, _, err := syncOnce(t, bigIx, sink, smallIx, false)
 		if err != nil {
@@ -304,7 +445,7 @@ func TestSyncOddChunkCount(t *testing.T) {
 	// 2 full chunks + a short one: 3 leaves, which exercises the
 	// promoted-node path of the tree.
 	data := pattern(2*chunkSize + 1000)
-	srv, err := NewIndex(bytes.NewReader(data))
+	srv, err := NewIndex(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +467,7 @@ func TestSyncOddChunkCount(t *testing.T) {
 	// delta: change the short chunk
 	nw := append([]byte(nil), data...)
 	nw[2*chunkSize+42] ^= 0xFF
-	srv2, _ := NewIndex(bytes.NewReader(nw))
+	srv2, _ := NewIndex(bytes.NewReader(nw), int64(len(nw)))
 	sink2 := &memSink{data: append([]byte(nil), data...)}
 	got2, wire, err := syncOnce(t, srv2, sink2, got, false)
 	if err != nil {
@@ -343,9 +484,96 @@ func TestSyncOddChunkCount(t *testing.T) {
 	}
 }
 
+// TestClose pins AC5: Close removes the temp memo file and is
+// idempotent.
+func TestClose(t *testing.T) {
+	data := pattern(3 * chunkSize)
+	ix, err := NewIndex(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := ix.memo.Name()
+	if _, err := os.Stat(name); err != nil {
+		t.Fatalf("memo missing before close: %v", err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatalf("close = %v", err)
+	}
+	if _, err := os.Stat(name); !os.IsNotExist(err) {
+		t.Fatalf("memo still exists after close: %v", err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatalf("second close = %v, want nil", err)
+	}
+}
+
+// TestPullResultAsPrior pins AC5: the index returned by Pull reflects
+// the synced file and works as the prior of a following no-op session.
+func TestPullResultAsPrior(t *testing.T) {
+	const chunks = 4
+	old := pattern(chunks * chunkSize)
+	nw := append([]byte(nil), old...)
+	for i := chunkSize; i < 2*chunkSize; i++ {
+		nw[i] ^= 0x5A
+	}
+	srv, err := NewIndex(bytes.NewReader(nw), int64(len(nw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, err := NewIndex(bytes.NewReader(old), int64(len(old)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSink{data: append([]byte(nil), old...)}
+	got, _, err := syncOnce(t, srv, sink, prior, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Root() != srv.Root() {
+		t.Fatal("pulled root differs from the server's")
+	}
+	_, wire, err := syncOnce(t, srv, sink, got, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire >= 128 {
+		t.Fatalf("no-op re-sync transferred %d bytes, want < 128", wire)
+	}
+}
+
+// writeFileFrom copies the first size bytes of src into f, overwriting
+// f.
+func writeFileFrom(f *os.File, src *virtualFile, size int64) error {
+	buf := make([]byte, 1<<20)
+	for off := int64(0); off < size; off += int64(len(buf)) {
+		n, _ := src.ReadAt(buf, off)
+		if _, err := f.WriteAt(buf[:n], off); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// compareFileWith asserts that f's content equals src's, reading both
+// in blocks so neither file's bytes sit in RAM.
+func compareFileWith(t *testing.T, f *os.File, src io.ReaderAt, size int64) {
+	t.Helper()
+	buf1 := make([]byte, 1<<20)
+	buf2 := make([]byte, 1<<20)
+	for off := int64(0); off < size; off += int64(len(buf1)) {
+		n1, err := f.ReadAt(buf1, off)
+		if err != nil && err != io.EOF {
+			t.Fatalf("read dst at %d: %v", off, err)
+		}
+		n2, _ := src.ReadAt(buf2, off)
+		if !bytes.Equal(buf1[:n1], buf2[:n2]) {
+			t.Fatalf("dst content differs from the server's at offset %d", off)
+		}
+	}
+}
+
 // TestPublicSurface pins the package's public interface to the
-// minimal set defined for T001: anything new exported requires a
-// deliberate decision.
+// minimal set: anything new exported requires a deliberate decision.
 func TestPublicSurface(t *testing.T) {
 	dir, err := filepath.Abs(".")
 	if err != nil {
@@ -360,6 +588,7 @@ func TestPublicSurface(t *testing.T) {
 	}
 	pkg := pkgs["merkle"]
 	got := map[string]bool{}
+	var newIdx *ast.FuncDecl
 	for _, f := range pkg.Files {
 		for _, d := range f.Decls {
 			switch d := d.(type) {
@@ -381,6 +610,9 @@ func TestPublicSurface(t *testing.T) {
 			case *ast.FuncDecl:
 				if d.Recv == nil && ast.IsExported(d.Name.Name) {
 					got[d.Name.Name] = true
+					if d.Name.Name == "NewIndex" {
+						newIdx = d
+					}
 				}
 			}
 		}
@@ -396,8 +628,8 @@ func TestPublicSurface(t *testing.T) {
 			t.Errorf("unexpected exported symbol %q", g)
 		}
 	}
-	// the two methods an Index exposes
-	for _, m := range []string{"Root", "Size"} {
+	// the three methods an Index exposes
+	for _, m := range []string{"Root", "Size", "Close"} {
 		found := false
 		for _, f := range pkg.Files {
 			for _, d := range f.Decls {
@@ -413,6 +645,22 @@ func TestPublicSurface(t *testing.T) {
 		if !found {
 			t.Errorf("missing Index method %q", m)
 		}
+	}
+	// NewIndex must take (io.ReaderAt, int64)
+	if newIdx == nil {
+		t.Fatal("NewIndex not found")
+	}
+	params := newIdx.Type.Params.List
+	if len(params) != 2 {
+		t.Fatalf("NewIndex takes %d parameters, want 2", len(params))
+	}
+	x, xok := params[0].Type.(*ast.SelectorExpr)
+	pkgName, pkgOk := x.X.(*ast.Ident)
+	if !xok || !pkgOk || pkgName.Name != "io" || x.Sel.Name != "ReaderAt" {
+		t.Errorf("NewIndex first parameter is not io.ReaderAt")
+	}
+	if id, ok := params[1].Type.(*ast.Ident); !ok || id.Name != "int64" {
+		t.Errorf("NewIndex second parameter is not int64")
 	}
 }
 

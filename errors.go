@@ -8,5 +8,5 @@ import "errors"
 var ErrMismatch = errors.New("merkle: hash mismatch")
 
 // ErrProtocol is returned when a peer sends a malformed or unexpected
-// message.
+// wire message.
 var ErrProtocol = errors.New("merkle: protocol error")

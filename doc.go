@@ -1,10 +1,12 @@
 // Package merkle synchronizes files over any bidirectional byte channel
 // using a chunked merkle tree.
 //
-// Indexing: NewIndex reads an io.Reader and returns an Index: a SHA-256
-// merkle tree over fixed 64 KiB chunks. The Index holds the file's bytes
-// so it can serve them later, and its Root changes when any byte of the
-// file changes — compare Roots to detect changes without re-syncing.
+// Indexing: NewIndex returns an Index over an io.ReaderAt of the given
+// size: a SHA-256 merkle tree over fixed 64 KiB chunks. The Index never
+// holds the file's bytes: it reads them only when a hash or a chunk
+// needs them, and memoizes computed hashes in a temp file that Close
+// removes. Its Root changes when any byte of the file changes —
+// compare Roots to detect changes without re-syncing.
 //
 // Syncing: a server calls Serve over an io.ReadWriter (a TCP connection,
 // an in-memory pipe, or a stream pair bridging HTTP); a client calls

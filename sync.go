@@ -30,15 +30,20 @@ func Serve(rw io.ReadWriter, ix *Index) error {
 		return err
 	}
 
-	if hello.root == ix.Root() && hello.size == ix.size {
+	root, err := ix.root()
+	if err != nil {
+		return err
+	}
+
+	if hello.root == root && hello.size == ix.size {
 		// Identical: a handshake only, no data.
-		return writeMsg(rw, msgAck, encodeAck(ackMsg{match: true, root: ix.Root(), size: ix.size}))
+		return writeMsg(rw, msgAck, encodeAck(ackMsg{match: true, root: root, size: ix.size}))
 	}
 
 	var changed []int
 	if hello.size != ix.size || hello.root == (Hash{}) {
 		// No file, or a different shape: send everything.
-		changed = make([]int, len(ix.levels[0].nodes))
+		changed = make([]int, ix.levels[0].n)
 		for i := range changed {
 			changed[i] = i
 		}
@@ -51,18 +56,30 @@ func Serve(rw io.ReadWriter, ix *Index) error {
 		}
 	}
 
-	ack := ackMsg{leaves: uint32(len(changed)), root: ix.Root(), size: ix.size}
+	ack := ackMsg{leaves: uint32(len(changed)), root: root, size: ix.size}
 	if err := writeMsg(rw, msgAck, encodeAck(ack)); err != nil {
 		return err
 	}
-	lev := ix.levels[0]
 	for _, i := range changed {
-		ln := lev.nodes[i]
-		if err := writeMsg(rw, msgLeaf, encodeLeaf(leafMsg{off: ln.off, hash: ln.h, data: ix.data[ln.off : ln.off+ln.size]})); err != nil {
+		if err := ix.sendLeaf(rw, i); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// sendLeaf streams the leaf i's frame from the reader through the
+// index's reusable buffer.
+func (ix *Index) sendLeaf(w io.Writer, i int) error {
+	off, sz := ix.rangeOf(0, i)
+	h, err := ix.hashNode(0, i)
+	if err != nil {
+		return err
+	}
+	if _, err := ix.r.ReadAt(ix.buf[:sz], off); err != nil {
+		return err
+	}
+	return writeMsg(w, msgLeaf, encodeLeaf(leafMsg{off: off, hash: h, data: ix.buf[:sz]}))
 }
 
 // Pull is the client side of a sync over rw. It brings dst up to date
@@ -92,7 +109,7 @@ func Pull(rw io.ReadWriter, dst Sink, prior *Index) (*Index, error) {
 			}
 			hs := make([]Hash, len(q.refs))
 			for i, r := range q.refs {
-				if h, ok := prior.lookup(r.off, r.size); ok {
+				if h, ok := prior.hashRange(r.off, r.size); ok {
 					hs[i] = h
 				}
 			}
@@ -114,21 +131,33 @@ func Pull(rw io.ReadWriter, dst Sink, prior *Index) (*Index, error) {
 	}
 }
 
+// root returns the file root, hashing the whole file once if the memo
+// does not have it yet.
+func (ix *Index) root() (Hash, error) {
+	if ix.size == 0 {
+		return Hash{}, nil
+	}
+	return ix.hashNode(len(ix.levels)-1, 0)
+}
+
 // descend finds the leaf indices of ix that differ from a peer, by
 // walking the tree top-down: each round it asks the peer for the
 // hashes of the children of the subtrees that still differ. The peer
 // callback performs one query/reply round per call.
 func (ix *Index) descend(peer func([]ref) ([]Hash, error)) ([]int, error) {
-	lvl := len(ix.levels) - 1
-	frontier := []int{0}
-	for lvl > 0 {
+	type fr struct {
+		lvl int
+		i   int
+	}
+	frontier := []fr{{lvl: len(ix.levels) - 1, i: 0}}
+	for lvl := len(ix.levels) - 1; lvl > 0; lvl-- {
 		var refs []ref
-		next := make([]int, 0, len(frontier)*2)
-		for _, ni := range frontier {
-			for _, c := range ix.levels[lvl].nodes[ni].child {
-				ch := ix.levels[lvl-1].nodes[c]
-				refs = append(refs, ref{off: ch.off, size: ch.size})
-				next = append(next, c)
+		next := make([]fr, 0, len(frontier)*2)
+		for _, f := range frontier {
+			for c := 2 * f.i; c < 2*f.i+2 && c < ix.levels[lvl-1].n; c++ {
+				off, sz := ix.rangeOf(lvl-1, c)
+				refs = append(refs, ref{off: off, size: sz})
+				next = append(next, fr{lvl: lvl - 1, i: c})
 			}
 		}
 		hs, err := peer(refs)
@@ -139,15 +168,22 @@ func (ix *Index) descend(peer func([]ref) ([]Hash, error)) ([]int, error) {
 			return nil, ErrProtocol
 		}
 		frontier = next[:0]
-		for i := range refs {
-			if hs[i] != ix.levels[lvl-1].nodes[next[i]].h {
-				frontier = append(frontier, next[i])
+		for i, f := range next {
+			h, err := ix.hashNode(f.lvl, f.i)
+			if err != nil {
+				return nil, err
+			}
+			if hs[i] != h {
+				frontier = append(frontier, f)
 			}
 		}
-		lvl--
 	}
-	sort.Ints(frontier)
-	return frontier, nil
+	leaves := make([]int, 0, len(frontier))
+	for _, f := range frontier {
+		leaves = append(leaves, f.i)
+	}
+	sort.Ints(leaves)
+	return leaves, nil
 }
 
 // queryPeer sends one batch of subtree refs to the peer and returns
@@ -170,23 +206,22 @@ func queryPeer(rw io.ReadWriter, refs []ref) ([]Hash, error) {
 	return m.hashes, nil
 }
 
-// apply writes the ack.leaves leaf messages from rw into dst, splices
-// them into a working copy of prior's bytes, and returns the index of
-// the resulting file.
+// apply writes the ack.leaves leaf messages from rw into dst and
+// patches prior's memo so it indexes the resulting file: same size
+// patches the changed leaf entries and their ancestors, a size change
+// rebuilds the memo from the received leaves. The final root is
+// compared to the ack's. The returned index is prior in both cases.
 func apply(rw io.ReadWriter, dst Sink, prior *Index, ack ackMsg) (*Index, error) {
-	var data []byte
-	if ack.size == prior.size && prior.size > 0 {
-		data = append([]byte(nil), prior.data...)
-	} else {
-		data = make([]byte, ack.size)
-	}
+	sameSize := ack.size == prior.size
 	if err := dst.Truncate(ack.size); err != nil {
 		return nil, err
 	}
-	leafHashes := make([]Hash, chunkCount(int(ack.size)))
-	if len(prior.levels) > 0 {
-		copy(leafHashes, priorLeafHashes(prior))
+	if !sameSize {
+		if err := prior.setLayout(ack.size); err != nil {
+			return nil, err
+		}
 	}
+	changed := make(map[int]bool, ack.leaves)
 	for i := 0; i < int(ack.leaves); i++ {
 		t, p, err := readMsg(rw)
 		if err != nil {
@@ -202,24 +237,36 @@ func apply(rw io.ReadWriter, dst Sink, prior *Index, ack ackMsg) (*Index, error)
 		if hash(m.data) != m.hash {
 			return nil, ErrMismatch
 		}
+		if m.off%chunkSize != 0 {
+			return nil, ErrProtocol
+		}
+		li := int(m.off / chunkSize)
+		if li >= prior.levels[0].n {
+			return nil, ErrProtocol
+		}
 		if _, err := dst.WriteAt(m.data, m.off); err != nil {
 			return nil, err
 		}
-		leafHashes[m.off/chunkSize] = m.hash
-		copy(data[m.off:], m.data)
+		if _, err := prior.memo.WriteAt(m.hash[:], prior.levels[0].off+int64(li)*32); err != nil {
+			return nil, err
+		}
+		changed[li] = true
 	}
-	ix := indexFrom(data, leafHashes)
-	if ix.Root() != ack.root {
+	var err error
+	if sameSize {
+		err = prior.patchAncestors(changed)
+	} else {
+		err = prior.computeAllLevels()
+	}
+	if err != nil {
+		return nil, err
+	}
+	root, err := prior.root()
+	if err != nil {
+		return nil, err
+	}
+	if root != ack.root {
 		return nil, ErrMismatch
 	}
-	return ix, nil
-}
-
-// priorLeafHashes returns the leaf-level hashes of ix.
-func priorLeafHashes(ix *Index) []Hash {
-	hs := make([]Hash, len(ix.levels[0].nodes))
-	for i := range hs {
-		hs[i] = ix.levels[0].nodes[i].h
-	}
-	return hs
+	return prior, nil
 }

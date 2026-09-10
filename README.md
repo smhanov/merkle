@@ -20,8 +20,13 @@ transfer.
 ## API
 
 ```go
-// Index a file from any reader.
-ix, err := merkle.NewIndex(r)
+// Index a file. The index is lazy: it holds no file bytes, reads them
+// only when a hash needs them, and memoizes hashes in a temp file
+// (removed by Close), so a terabyte file costs O(tree depth) of memory.
+f, err := os.Open("file")
+fi, err := f.Stat()
+ix, err := merkle.NewIndex(f, fi.Size())
+defer ix.Close()
 
 // ix.Root() changes when any byte of the file changes — compare roots
 // to detect changes. ix.Size() is the file length.
@@ -36,9 +41,10 @@ err = merkle.Serve(conn, ix)
 newIx, err := merkle.Pull(conn, file, prior)
 ```
 
-`*os.File` satisfies `merkle.Sink` (the client-side write target), which
-is all the client needs. If the file is unchanged, `Pull` returns the
-prior index and leaves the file untouched.
+`*os.File` satisfies both `io.ReaderAt` (indexing) and `merkle.Sink`
+(the client-side write target), which is all the client needs. If the
+file is unchanged, `Pull` returns the prior index and leaves the file
+untouched.
 
 ## How the sync works
 
@@ -68,14 +74,17 @@ Core package: indexing and sync are implemented and tested (determinism,
 no-op / delta / from-scratch / shrink / grow / odd chunk counts,
 corruption detection, wire-byte budgets).
 
-Not yet included (see `.plans/`): TCP/HTTP transport adapters,
-disk-backed indexes for very large files.
+Not yet included (see `.plans/`): transport adapters.
 
 ## Notes
 
-- An `Index` holds the file's bytes in memory so it can serve them;
-  for very large files, index it once and reuse the `Index` across
-  sessions rather than re-indexing per sync.
+- An `Index` never holds the file's bytes: it reads them on demand from
+  its `io.ReaderAt` and memoizes computed hashes in a temp file, removed
+  by `Close`. Memory is O(tree depth); the memo is at most 32 bytes per
+  64 KiB chunk (~0.1% of a large file's size).
+- A session over an existing file hashes it once: the hello carries the
+  file's root, which forces every node. That is the cost of stateless
+  change detection — nothing is persisted between runs.
 - Errors: `ErrMismatch` when a received chunk or final root fails
   verification, `ErrProtocol` for a malformed peer. On error the local
   file may be partially updated; re-`Pull` with the same prior index to
