@@ -1,0 +1,1 @@
+Design philosophy: Be pragmatic and minimalist. Prefer the simplest solution that solves the current, concrete requirements; follow YAGNI aggressively—do not add abstractions, extensibility, security infrastructure, or operational complexity for hypothetical future needs.

@@ -1,0 +1,4 @@
+/.plans/
+*.test
+*.out
+/bin/
