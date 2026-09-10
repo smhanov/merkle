@@ -2,12 +2,16 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -277,7 +281,8 @@ type sessionResult struct {
 // path is the source (Serve; absent = error), roleResident = the
 // peer's header decides (peer source -> updated side, peer client ->
 // source side). Pass a *countingRW so res.bytes is the channel's
-// byte total.
+// byte total. It is a single-file session: syncFileRel with an empty
+// relPath.
 //
 // Close contract: the local file is closed before returning in all
 // cases. Pull returns the passed prior index (patched in place) or a
@@ -285,19 +290,38 @@ type sessionResult struct {
 // the index is closed exactly once here; the sentinel's nil memo
 // makes Close a no-op.
 func syncFile(rw io.ReadWriter, myRole byte, path string) (res sessionResult, err error) {
-	peer, err := exchangeHeader(rw, myRole, "")
+	return syncFileRel(rw, myRole, path, "")
+}
+
+// syncFileRel is the per-file sync unit with a relPath carried in the
+// session header: exchange the header (myRole, relPath), resolve the
+// effective role, and run the file I/O core.
+func syncFileRel(rw io.ReadWriter, myRole byte, path, relPath string) (res sessionResult, err error) {
+	peer, err := exchangeHeader(rw, myRole, relPath)
 	if err != nil {
 		return res, err
 	}
 	role := myRole
 	if myRole == roleResident {
-		if peer.role == roleSource {
-			role = roleClient
-		} else {
-			role = roleSource
-		}
+		role = roleFromPeer(peer)
 	}
+	return runFile(rw, role, path)
+}
 
+// roleFromPeer resolves this side's role when resident: the peer's
+// role decides (peer source -> updated side, peer client -> source
+// side).
+func roleFromPeer(peer header) byte {
+	if peer.role == roleSource {
+		return roleClient
+	}
+	return roleSource
+}
+
+// runFile is the file I/O core of a per-file session: set up the
+// protocol channel over rw, open path, and run merkle.Pull (updated
+// side) or merkle.Serve (source side), filling res.
+func runFile(rw io.ReadWriter, role byte, path string) (res sessionResult, err error) {
 	prw := &protocolRW{
 		fr: &frameCounter{next: rw},
 		fw: &frameCountingWriter{next: rw},
@@ -363,16 +387,16 @@ func syncFile(rw io.ReadWriter, myRole byte, path string) (res sessionResult, er
 			}
 			return res, err
 		}
-		fi, err := f.Stat()
-		if err != nil {
-			return res, err
+		fi, statErr := f.Stat()
+		if statErr != nil {
+			return res, statErr
 		}
 		if fi.IsDir() {
 			return res, fmt.Errorf("merkle: %s: is a directory", path)
 		}
-		ix, err := merkle.NewIndex(f, fi.Size())
-		if err != nil {
-			return res, err
+		ix, statErr := merkle.NewIndex(f, fi.Size())
+		if statErr != nil {
+			return res, statErr
 		}
 		got = ix
 		err = merkle.Serve(prw, ix)
@@ -635,6 +659,246 @@ func oneShotSSH(srcArg, dstArg string, src, dst spec, role byte) {
 	}
 }
 
+// walkDir collects the relpaths of every regular file under root and
+// the relpaths of every skipped entry (symlinks and other non-regular,
+// non-dir entries; counted, not followed), both sorted for
+// determinism; the root dir itself is ignored.
+func walkDir(root string) (files, skipped []string, err error) {
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == root {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, p)
+		if relErr != nil {
+			return relErr
+		}
+		switch {
+		case d.Type().IsRegular():
+			files = append(files, rel)
+		case !d.IsDir():
+			skipped = append(skipped, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	sort.Strings(files)
+	sort.Strings(skipped)
+	return files, skipped, nil
+}
+
+// perFileLine formats the per-file folder-sync line (relpath as
+// subject, decision-6 shapes): "up to date" when the session was a
+// no-op (updater side: no leaves received and size unchanged; source
+// side: no leaves sent), else the byte total plus, for the updater
+// side, the changed-chunk clause.
+func perFileLine(rel string, res sessionResult, isUpdater bool) string {
+	noop := false
+	if isUpdater {
+		noop = res.leavesIn == 0 && res.preSize == res.postSize
+	} else {
+		noop = res.leavesOut == 0
+	}
+	if noop {
+		return rel + ": up to date"
+	}
+	if isUpdater {
+		return fmt.Sprintf("%s: %d bytes transferred (%d of %d chunks changed)", rel, res.bytes, res.leavesIn, chunkCount(res.postSize))
+	}
+	return fmt.Sprintf("%s: %d bytes transferred", rel, res.bytes)
+}
+
+// reportFolderResult prints the skipped-file lines to stderr and the
+// AC8 summary line to stdout, and exits 1 when any file failed (AC7).
+func reportFolderResult(files, skipped []string, ok int, total int64, failed int) {
+	for _, rel := range skipped {
+		fmt.Fprintf(os.Stderr, "%s: skipped (not a regular file)\n", rel)
+	}
+	line := fmt.Sprintf("%d files synced, %d bytes transferred", ok, total)
+	if len(skipped) > 0 {
+		line += fmt.Sprintf(", %d skipped", len(skipped))
+	}
+	if failed > 0 {
+		line += fmt.Sprintf(", %d failed", failed)
+	}
+	fmt.Println(line)
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+// folderLocal mirrors srcDir into dstDir over a single 127.0.0.1
+// loopback connection: per sorted file, the dst side runs as
+// roleClient on the accepted end and the src side as roleSource on
+// the dialed end of the same connection; the per-file line is the
+// dst/updater side's. Parent dirs are created as needed; a failed
+// file is reported to stderr and the connection dropped so the next
+// file reconnects fresh (AC7).
+func folderLocal(srcDir, dstDir string) {
+	files, skipped, err := walkDir(srcDir)
+	if err != nil {
+		fail(err)
+	}
+	var (
+		conn  net.Conn
+		srcRW *countingRW
+		dstRW *countingRW
+	)
+	open := func() error {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return err
+		}
+		conn, err = net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		peer, err := ln.Accept()
+		ln.Close()
+		if err != nil {
+			conn.Close()
+			return err
+		}
+		dstRW = &countingRW{rw: peer}
+		srcRW = &countingRW{rw: conn}
+		return nil
+	}
+	close := func() {
+		if conn != nil {
+			conn.Close()
+		}
+		conn, srcRW, dstRW = nil, nil, nil
+	}
+	defer close()
+
+	var (
+		ok     int
+		total  int64
+		failed int
+	)
+	for _, rel := range files {
+		if dstRW == nil {
+			if err := open(); err != nil {
+				fail(err)
+			}
+		}
+		srcPath := filepath.Join(srcDir, rel)
+		dstPath := filepath.Join(dstDir, rel)
+		os.MkdirAll(filepath.Dir(dstPath), 0o755)
+		drw := dstRW
+		var (
+			dres sessionResult
+			derr error
+		)
+		done := make(chan struct{}, 1)
+		go func() {
+			dres, derr = syncFileRel(drw, roleClient, dstPath, rel)
+			if derr != nil {
+				conn.Close() // unblock the peer
+			}
+			done <- struct{}{}
+		}()
+		_, serr := syncFileRel(srcRW, roleSource, srcPath, rel)
+		if serr != nil {
+			conn.Close() // unblock the peer
+		}
+		<-done
+		switch {
+		case derr != nil:
+			fmt.Fprintf(os.Stderr, "%s: %v\n", rel, derr)
+			failed++
+			close()
+		case serr != nil:
+			fmt.Fprintf(os.Stderr, "%s: %v\n", rel, serr)
+			failed++
+			close()
+		default:
+			fmt.Println(perFileLine(rel, dres, true))
+			total += dres.bytes
+			ok++
+		}
+	}
+	reportFolderResult(files, skipped, ok, total, failed)
+}
+
+// folderPush pushes the files of srcDir, in sorted relpath order, to a
+// running `merkle serve <dir>` endpoint (step 2): TCP re-dials the
+// endpoint per connection, ssh runs one `merkle serve <dir> -listen -`
+// session per file over the ssh stdio (the remote exits after each).
+// The per-file line is the source side's (byte total only); a failed
+// file is reported to stderr and the connection dropped so the next
+// file reconnects fresh (AC7).
+func folderPush(srcDir string, end spec) {
+	files, skipped, err := walkDir(srcDir)
+	if err != nil {
+		fail(err)
+	}
+	var (
+		conn   net.Conn
+		crw    *countingRW
+		finish func() error
+	)
+	open := func() error {
+		if end.kind == kindTCP {
+			var err error
+			conn, err = net.Dial("tcp", net.JoinHostPort(end.host, strconv.Itoa(end.port)))
+			if err != nil {
+				return err
+			}
+			crw = &countingRW{rw: conn}
+			return nil
+		}
+		var rw io.ReadWriter
+		var err error
+		rw, finish, err = sshSession(end.user, end.host, "merkle serve "+shellQuote(end.path)+" -listen -")
+		if err != nil {
+			return err
+		}
+		crw = &countingRW{rw: rw}
+		return nil
+	}
+	close := func() {
+		if conn != nil {
+			conn.Close()
+		}
+		if finish != nil {
+			finish()
+			finish = nil
+		}
+		conn, crw = nil, nil
+	}
+	defer close()
+
+	var (
+		ok     int
+		total  int64
+		failed int
+	)
+	for _, rel := range files {
+		if crw == nil {
+			if err := open(); err != nil {
+				fail(err)
+			}
+		}
+		res, err := syncFileRel(crw, roleSource, filepath.Join(srcDir, rel), rel)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", rel, err)
+			failed++
+			close()
+			continue
+		}
+		fmt.Println(perFileLine(rel, res, false))
+		total += res.bytes
+		ok++
+	}
+	reportFolderResult(files, skipped, ok, total, failed)
+}
+
 // handleServeConn runs one per-file session on a resident connection:
 // syncFile re-opens and re-indexes the file, so a file edited on disk
 // between connections is picked up without a restart and no file
@@ -652,12 +916,80 @@ func handleServeConn(conn net.Conn, name string) {
 	fmt.Println(serveLine(peer, name, res, wasUpdatedSide(res)))
 }
 
-// serveCmd implements `merkle serve <file> [-listen addr]` (plan step
-// 5): the resident sync endpoint for one file. `-listen -` runs exactly
-// one session on stdin/stdout (the form an ssh one-shot runs on the
-// remote, human output on stderr so the protocol stream stays clean);
-// any other address runs a TCP accept loop. The file is checked at
-// startup (decision 5) and re-opened per connection, never held.
+// resolveDirPath resolves a peer relpath against the served directory
+// root and rejects any path that escapes it (the AC5 traversal guard).
+func resolveDirPath(root, rel string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	full := filepath.Clean(filepath.Join(cleanRoot, rel))
+	if full != cleanRoot && !strings.HasPrefix(full, cleanRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("merkle: path %q escapes the served directory", rel)
+	}
+	return full, nil
+}
+
+// serveDirFile runs one per-file session on a directory-resident
+// connection: the peer's header carries the relpath of the file to
+// sync (a directory has no single path of its own); parent
+// directories are created as needed.
+func serveDirFile(rw io.ReadWriter, root string) (res sessionResult, rel string, err error) {
+	peer, err := exchangeHeader(rw, roleResident, "")
+	if err != nil {
+		return res, "", err
+	}
+	rel = peer.path
+	if rel == "" {
+		return res, "", fmt.Errorf("merkle: missing path (want <relpath>)")
+	}
+	path, err := resolveDirPath(root, rel)
+	if err != nil {
+		return res, rel, err
+	}
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	res, err = runFile(rw, roleFromPeer(peer), path)
+	return res, rel, err
+}
+
+// isCleanClose reports whether err is the peer ending the connection
+// (EOF, a reset, or a closed-network error) — the end of a folder
+// rather than a fault worth logging.
+func isCleanClose(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "connection reset by peer") || strings.Contains(s, "use of closed network connection")
+}
+
+// handleServeDirConn runs the per-file sessions of one folder on a
+// resident directory connection, keyed by the relpath in each session
+// header, until the client closes it. A per-connection error is
+// reported to stderr and the conn closed; the resident keeps
+// accepting (decision 7).
+func handleServeDirConn(conn net.Conn, root string) {
+	peer := conn.RemoteAddr().String()
+	defer conn.Close()
+	crw := &countingRW{rw: conn}
+	for {
+		res, rel, err := serveDirFile(crw, root)
+		if err != nil {
+			if !isCleanClose(err) {
+				fmt.Fprintf(os.Stderr, "%s -> %s: %v\n", peer, root, err)
+			}
+			return // client closed (or errored): drop this conn, the accept loop takes the next
+		}
+		fmt.Println(serveLine(peer, rel, res, wasUpdatedSide(res)))
+	}
+}
+
+// serveCmd implements `merkle serve <file-or-dir> [-listen addr]` (plan
+// step 5): the resident sync endpoint for one file or one directory
+// (directory: the peer's header carries each file's relpath). `-listen
+// -` runs one session (file) or the folder's per-file sessions until
+// stdin closes (directory) on stdin/stdout (the form an ssh one-shot
+// runs on the remote, human output on stderr so the protocol stream
+// stays clean); any other address runs a TCP accept loop. The
+// path is checked at startup (decision 5) and re-opened per
+// connection, never held.
 func serveCmd(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	listen := fs.String("listen", ":9000", "address to listen on; \"-\" = one session on stdin/stdout")
@@ -671,7 +1003,7 @@ func serveCmd(args []string) {
 		file = fs.Arg(0)
 	case file != "" && fs.NArg() == 0:
 	default:
-		fmt.Fprintln(os.Stderr, "usage: merkle serve <file> [-listen addr]")
+		fmt.Fprintln(os.Stderr, "usage: merkle serve <file-or-dir> [-listen addr]")
 		os.Exit(1)
 	}
 	name := file
@@ -682,11 +1014,22 @@ func serveCmd(args []string) {
 		}
 		fail(err)
 	}
-	if fi.IsDir() {
-		fail(fmt.Errorf("merkle: %s: is a directory", name))
-	}
+	isDir := fi.IsDir()
 	if *listen == "-" {
-		res, err := syncFile(&countingRW{rw: &sshRW{r: os.Stdin, w: os.Stdout}}, roleResident, name)
+		crw := &countingRW{rw: &sshRW{r: os.Stdin, w: os.Stdout}}
+		if isDir {
+			for {
+				res, rel, err := serveDirFile(crw, name)
+				if err != nil {
+					if !isCleanClose(err) {
+						fmt.Fprintf(os.Stderr, "stdio -> %s: %v\n", name, err)
+					}
+					return // stdin closed: the folder is done
+				}
+				fmt.Fprintln(os.Stderr, serveLine("stdio", rel, res, wasUpdatedSide(res)))
+			}
+		}
+		res, err := syncFile(crw, roleResident, name)
 		if err != nil {
 			fail(err)
 		}
@@ -703,8 +1046,19 @@ func serveCmd(args []string) {
 		if err != nil {
 			fail(err)
 		}
-		handleServeConn(conn, name)
+		if isDir {
+			handleServeDirConn(conn, name)
+		} else {
+			handleServeConn(conn, name)
+		}
 	}
+}
+
+// isLocalDir reports whether p exists and is a directory (the folder
+// dispatch test for a local src/dst argument).
+func isLocalDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 func main() {
@@ -725,9 +1079,27 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	srcIsDir := src.kind == kindLocal && isLocalDir(src.path)
+	dstIsDir := dst.kind == kindLocal && isLocalDir(dst.path)
 	switch {
 	case src.kind != kindLocal && dst.kind != kindLocal:
 		fail(fmt.Errorf("v1 takes at most one remote endpoint"))
+	case srcIsDir:
+		if dst.kind == kindLocal {
+			// dst may be an existing dir or not exist yet (created as
+			// needed); only an existing regular file is a mistake.
+			if fi, err := os.Stat(dst.path); err == nil && !fi.IsDir() {
+				fail(fmt.Errorf("merkle: src is a directory but dst %q is a file", dst.path))
+			}
+			folderLocal(src.path, dst.path)
+		} else {
+			folderPush(src.path, dst)
+		}
+	case dstIsDir:
+		if src.kind == kindLocal {
+			fail(fmt.Errorf("merkle: src %q is a file but dst is a directory", src.path))
+		}
+		fail(fmt.Errorf("merkle: pulling a remote folder (%s) is not supported in v1", srcArg))
 	case src.kind == kindLocal && dst.kind == kindLocal:
 		oneShotLocal(srcArg, dstArg, src, dst)
 	case dst.kind == kindTCP:
