@@ -1,86 +1,82 @@
 # merkle
 
-Efficient file synchronization over any bidirectional channel, using chunked
-Merkle trees.
+Efficient file synchronization over any bidirectional byte channel, using a
+chunked merkle tree.
 
-## Status
+A file is split into fixed 64 KiB chunks; a SHA-256 merkle tree over the
+chunk hashes authenticates every byte of the file. Two peers reconcile
+their trees by exchanging hashes only along the paths that differ, then
+transfer only the chunks that actually changed:
 
-The package currently defines the protocol and the public API (types and
-interfaces). The in-memory index, the sync loop, and the codecs are in
-progress.
+- an **unchanged** file transfers nothing but ~100 bytes of handshake;
+- a file with **a few changed chunks** transfers exactly those chunks,
+  each verified by hash on arrival;
+- a **missing** local file transfers the whole file, chunk by chunk.
 
-## How it works
+There is nothing to configure: chunking and hashing are fixed, and peers
+running different versions of the package degrade gracefully to a full
+transfer.
 
-A file is split into fixed-size chunks (default 64 KiB). A binary Merkle
-tree over the chunk hashes authenticates every byte of the file: any
-subtree's hash covers all of its leaves.
-
-Two peers reconcile their trees by exchanging hashes only along the paths
-that differ (an interactive descent, level by level), then transfer only
-the changed chunks. Because internal node hashes are deterministic
-functions of their children, only leaf data and leaf hashes ever cross
-the wire.
-
-Transfer cost:
-
-- **Identical files** — one round trip, zero data.
-- **k changed chunks** — those k chunks, plus O(k log n) bytes of hash
-  metadata.
-- **No local file (from scratch)** — the full file, chunk by chunk, every
-  chunk verified by its hash; overhead is a few percent of one chunk.
-
-The sync API is transport-generic: it operates on an `io.ReadWriter`
-(a TCP connection, an in-memory pipe, or an adapter over a streaming
-HTTP request/response pair) plus a `Codec` that frames the protocol
-messages. Indexing takes an `io.Reader`.
-
-## API (target)
+## API
 
 ```go
 // Index a file from any reader.
-ix, err := merkle.NewIndexer(merkle.WithChunkSize(1 << 20)).Build(ctx, r)
+ix, err := merkle.NewIndex(r)
 
-// Server: serve an authoritative file over any bidirectional channel.
-err = merkle.Serve(ctx, link, codec, file, ix)
+// ix.Root() changes when any byte of the file changes — compare roots
+// to detect changes. ix.Size() is the file length.
 
-// Client: bring a local file up to date. localIndex may be nil
-// (no file yet). Returns the index of the resulting file for future syncs.
-remote, err := merkle.Sync(ctx, link, codec, file, localIndex)
+// Server side: serve the indexed file over any io.ReadWriter
+// (a TCP connection, a pipe, or a stream pair bridging HTTP).
+err = merkle.Serve(conn, ix)
+
+// Client side: bring a local file up to date. prior is the index of
+// the current local file, or nil if the file is absent. Returns the
+// index of the synced file, ready to use as prior next time.
+newIx, err := merkle.Pull(conn, file, prior)
 ```
 
-`*os.File` satisfies both the server-side `Source` and the client-side
-`Sink`.
+`*os.File` satisfies `merkle.Sink` (the client-side write target), which
+is all the client needs. If the file is unchanged, `Pull` returns the
+prior index and leaves the file untouched.
 
-## Protocol (v1)
+## How the sync works
 
-| Type      | Direction   | Payload    | Purpose                                          |
-| --------- | ----------- | ---------- | ------------------------------------------------ |
-| Request   | client→server | `Request` | Client's tree: chunk size, size, root (zero = no file) |
-| Query     | server→client | `Query`   | Ask for hashes of the referenced subtrees         |
-| Replies   | client→server | `Replies` | Subtree hashes, in query order                    |
-| Response  | server→client | `Response`| Reconciliation result; ends the descent          |
-| Leaf      | server→client | `Node`    | One chunk: hash, offset, data                     |
+One session per `Serve`/`Pull` call over the channel:
 
-Flow: the client sends one `Request`. If the roots match, the server
-replies `Response{Match:true}` and nothing else is sent. Otherwise the
-server and client descend the tree together: each round the server asks
-for the children of the subtrees that still differ, and the client
-answers with its own hashes. When the descent reaches the changed
-leaves, the server sends a `Response` followed by one `Leaf` message per
-changed chunk (or all chunks, when the client has no file or a
-different file shape). The client writes each leaf at its offset, then
-verifies that its rebuilt root equals the authoritative root.
+1. The client sends the size and root of its local file (zero root if
+   the file is absent).
+2. Roots equal → the server replies and nothing else is sent.
+3. Sizes differ, or the client has no file → the server streams every
+   chunk.
+4. Otherwise the two sides descend the tree together: each round the
+   server asks for the hashes of the children of the subtrees that still
+   differ, and the client answers. This pinpoints the changed chunks
+   in ≤ log2(n) rounds without ever transferring a chunk or a full
+   hash table.
+5. The server sends the changed chunks, each with its offset and hash.
+   The client writes them at their offsets, verifies each hash, and
+   checks that its rebuilt root matches the server's announced root.
 
-## Repository layout
+Wire format (internal, for reference): 1-byte type + 4-byte big-endian
+length + payload, in both directions; message types are
+hello / query / reply / ack / leaf.
 
-```
-merkle.go     package docs: model, protocol, efficiency guarantees
-hash.go       Hash, Hasher
-node.go       Node, Patch, Ref
-index.go      Index interface
-indexer.go    Indexer, NewIndexer, options
-message.go    wire message types and payloads
-codec.go      Link, Codec
-sync.go       Source, Sink, Serve, Sync
-errors.go     sentinel errors
-```
+## Status
+
+Core package: indexing and sync are implemented and tested (determinism,
+no-op / delta / from-scratch / shrink / grow / odd chunk counts,
+corruption detection, wire-byte budgets).
+
+Not yet included (see `.plans/`): TCP/HTTP transport adapters,
+disk-backed indexes for very large files.
+
+## Notes
+
+- An `Index` holds the file's bytes in memory so it can serve them;
+  for very large files, index it once and reuse the `Index` across
+  sessions rather than re-indexing per sync.
+- Errors: `ErrMismatch` when a received chunk or final root fails
+  verification, `ErrProtocol` for a malformed peer. On error the local
+  file may be partially updated; re-`Pull` with the same prior index to
+  retry.
