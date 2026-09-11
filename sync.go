@@ -186,24 +186,35 @@ func (ix *Index) descend(peer func([]ref) ([]Hash, error)) ([]int, error) {
 	return leaves, nil
 }
 
-// queryPeer sends one batch of subtree refs to the peer and returns
-// the peer's hashes in the same order.
+// queryPeer sends the level's refs to the peer in batches of at most
+// maxBatch and returns the peer's hashes in the same order, one
+// query/reply round-trip per batch. A level that fits one batch sends
+// exactly the same bytes as an unbatched frame.
 func queryPeer(rw io.ReadWriter, refs []ref) ([]Hash, error) {
-	if err := writeMsg(rw, msgQuery, encodeQuery(queryMsg{refs: refs})); err != nil {
-		return nil, err
+	hs := make([]Hash, 0, len(refs))
+	for len(refs) > 0 {
+		n := min(len(refs), maxBatch)
+		if err := writeMsg(rw, msgQuery, encodeQuery(queryMsg{refs: refs[:n]})); err != nil {
+			return nil, err
+		}
+		t, p, err := readMsg(rw)
+		if err != nil {
+			return nil, err
+		}
+		if t != msgReply {
+			return nil, ErrProtocol
+		}
+		m, err := decodeReply(p)
+		if err != nil {
+			return nil, err
+		}
+		if len(m.hashes) != n {
+			return nil, ErrProtocol
+		}
+		hs = append(hs, m.hashes...)
+		refs = refs[n:]
 	}
-	t, p, err := readMsg(rw)
-	if err != nil {
-		return nil, err
-	}
-	if t != msgReply {
-		return nil, ErrProtocol
-	}
-	m, err := decodeReply(p)
-	if err != nil {
-		return nil, err
-	}
-	return m.hashes, nil
+	return hs, nil
 }
 
 // apply writes the ack.leaves leaf messages from rw into dst and

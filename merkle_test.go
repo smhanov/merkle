@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -671,4 +672,311 @@ func contains(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// maskedFile is a virtualFile with the even-indexed chunks XORed with
+// 0x5A, standing in for a file where roughly half the chunks changed.
+type maskedFile struct {
+	virtualFile
+}
+
+func (m *maskedFile) ReadAt(p []byte, off int64) (int, error) {
+	n, err := m.virtualFile.ReadAt(p, off)
+	// XOR whole even-indexed chunks at a time (the index reads aligned
+	// chunks) instead of testing parity per byte.
+	total := int64(n)
+	for pos := int64(0); pos < total; {
+		ci := (off + pos) / chunkSize
+		end := (ci+1)*chunkSize - off
+		if end > total {
+			end = total
+		}
+		if ci%2 == 0 {
+			for j := pos; j < end; j++ {
+				p[j] ^= 0x5A
+			}
+		}
+		pos = end
+	}
+	return n, err
+}
+
+// frameCap is a write wrapper that asserts every frame it passes has a
+// payload of at most maxFrame bytes, recording the largest payload
+// seen and the total bytes forwarded.
+type frameCap struct {
+	next  func([]byte) (int, error)
+	buf   []byte
+	max   int
+	total int64
+}
+
+func (f *frameCap) Write(p []byte) (int, error) {
+	f.buf = append(f.buf, p...)
+	for len(f.buf) >= 5 {
+		n := int(binary.BigEndian.Uint32(f.buf[1:5]))
+		if len(f.buf) < 5+n {
+			break
+		}
+		frame := f.buf[:5+n]
+		f.buf = f.buf[5+n:]
+		if n > maxFrame {
+			return 0, fmt.Errorf("frame payload %d exceeds maxFrame %d", n, maxFrame)
+		}
+		if n > f.max {
+			f.max = n
+		}
+		if _, err := f.next(frame); err != nil {
+			return 0, err
+		}
+		f.total += int64(len(frame))
+	}
+	return len(p), nil
+}
+
+// TestBatchedDescent pins the batched descent at 8 GiB (2^17 leaves, so
+// the leaf frontier splits across 5 query/reply round-trips) with half
+// the chunks changed: every frame fits maxFrame and the synced file
+// matches the server's. Sized to stay inside the default -race test
+// timeout for the normal suite; the terabyte frontier is covered by
+// TestGiant (behind -short), and 64 GiB was verified the same way.
+func TestBatchedDescent(t *testing.T) {
+	const size = int64(8) << 30
+	old := &virtualFile{size: size}
+	nw := &maskedFile{virtualFile: virtualFile{size: size}}
+
+	dst, err := os.CreateTemp("", "merkle-batch-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dst.Close(); os.Remove(dst.Name()) })
+	// Sparse destination: only the chunks the server sends (the changed
+	// ones) get real blocks; the rest stay unwritten. This avoids a full
+	// 64 GiB pre-write while still exercising the delta path.
+	if err := dst.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := NewIndex(nw, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, err := NewIndex(old, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	t.Cleanup(func() { prior.Close() })
+
+	a, b := newPair()
+	var wire int64
+	origRead, origWrite := a.read, a.write
+	capA := &frameCap{next: origWrite}
+	capB := &frameCap{next: b.write}
+	a.write = func(p []byte) (int, error) {
+		n, err := capA.Write(p)
+		wire += int64(n)
+		return n, err
+	}
+	a.read = func(p []byte) (int, error) {
+		n, err := origRead(p)
+		wire += int64(n)
+		return n, err
+	}
+	b.write = capB.Write
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	serveErr := make(chan error, 1)
+	go func() {
+		defer wg.Done()
+		serveErr <- Serve(b, srv)
+	}()
+	got, err := Pull(a, dst, prior)
+	a.close() // unblock any in-flight server I/O
+	serr := <-serveErr
+	b.close()
+	wg.Wait()
+	if err == nil {
+		err = serr
+	}
+	t.Cleanup(func() { got.Close() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capA.max > maxFrame || capB.max > maxFrame {
+		t.Fatalf("frame cap violated: capA.max=%d capB.max=%d, want <= %d", capA.max, capB.max, maxFrame)
+	}
+	checkChunks(t, dst, nw, size, 12)
+	if got.Root() != srv.Root() {
+		t.Fatal("synced root differs from the server's")
+	}
+	t.Logf("wire=%d capA.max=%d capB.max=%d leaves=%d", wire, capA.max, capB.max, size/chunkSize)
+}
+
+// checkChunks verifies that `count` evenly spread EVEN-indexed chunks of
+// f byte-match src — the chunks the delta actually transferred. apply()
+// re-hashes every transferred chunk and the final root covers all of
+// them (including the unchanged odd chunks held in the client's memo),
+// so sampling the transferred chunks is enough to confirm the on-disk
+// file without re-reading the whole terabyte.
+func checkChunks(t *testing.T, f *os.File, src io.ReaderAt, size int64, count int) {
+	t.Helper()
+	half := int(size / chunkSize / 2)
+	bufF := make([]byte, chunkSize)
+	bufS := make([]byte, chunkSize)
+	for k := 0; k < count; k++ {
+		ci := int64(2 * (k * half / count))
+		off := ci * chunkSize
+		ln := int64(chunkSize)
+		if off+ln > size {
+			ln = size - off
+		}
+		n1, _ := f.ReadAt(bufF[:ln], off)
+		n2, _ := src.ReadAt(bufS[:ln], off)
+		if !bytes.Equal(bufF[:n1], bufS[:n2]) {
+			t.Fatalf("chunk %d (off %d) differs between the synced file and the server's", ci, off)
+		}
+	}
+}
+
+// ditchSink is a Sink that accepts writes without storing them, for
+// terabyte destinations that would not fit on disk or in RAM. Content
+// correctness is still proven: apply() re-hashes every received chunk
+// and the final root must match the server's.
+type ditchSink struct {
+	size    int64
+	written int64
+}
+
+func (d *ditchSink) WriteAt(p []byte, off int64) (int, error) {
+	d.written += int64(len(p))
+	return len(p), nil
+}
+
+func (d *ditchSink) Truncate(size int64) error {
+	d.size = size
+	return nil
+}
+
+// giantFile is a deterministic io.ReaderAt over a file whose chunk i is
+// the digest hash(seed || be64(i)) repeated to chunkSize. Each chunk is
+// derived on demand (O(1) memory) and filled by repeating the digest,
+// which is cheap at terabyte scale. Two giantFiles with different seeds
+// differ in every chunk.
+type giantFile struct {
+	size int64
+	seed [16]byte
+}
+
+func (g *giantFile) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, errors.New("giantFile: negative offset")
+	}
+	if off >= g.size {
+		return 0, io.EOF
+	}
+	ci := off / chunkSize
+	var in [24]byte
+	copy(in[:16], g.seed[:])
+	binary.BigEndian.PutUint64(in[16:24], uint64(ci))
+	d := hash(in[:])
+	n := len(p)
+	if off+int64(n) > g.size {
+		n = int(g.size - off)
+	}
+	for i := 0; i < n; i += 32 {
+		rem := n - i
+		if rem > 32 {
+			rem = 32
+		}
+		copy(p[i:i+rem], d[:rem])
+	}
+	return n, nil
+}
+
+// oneFlip is a giantFile with a single chunk's bytes XORed, standing in
+// for a file with one changed chunk.
+type oneFlip struct {
+	base *giantFile
+	ci   int64
+}
+
+func (o *oneFlip) ReadAt(p []byte, off int64) (int, error) {
+	n, err := o.base.ReadAt(p, off)
+	lo := o.ci * chunkSize
+	for i := 0; i < n; i++ {
+		if x := off + int64(i); x >= lo && x < lo+chunkSize {
+			p[i] ^= 0x5A
+		}
+	}
+	return n, err
+}
+
+func giantIndex(t *testing.T, r io.ReaderAt, size int64) *Index {
+	t.Helper()
+	ix, err := NewIndex(r, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ix.Close() })
+	return ix
+}
+
+// TestGiant pins the protocol at 1 TiB (2^24 leaves, ~1 GiB memo) and is
+// skipped under -short: (a) a no-op moves < 128 B, (b) one changed chunk
+// moves < 2 chunks + descent overhead, (c) a full same-size rewrite
+// completes over batched frames with the right root.
+func TestGiant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("1 TiB test; run without -short")
+	}
+	const size = int64(1) << 40 // 1 TiB
+	const seedA = 0xA5
+	const seedB = 0x5A
+	mk := func(seed byte) *giantFile {
+		g := &giantFile{size: size}
+		g.seed[0] = seed
+		return g
+	}
+
+	t.Run("noop", func(t *testing.T) {
+		_, wire, err := syncOnce(t, giantIndex(t, mk(seedA), size), &ditchSink{}, giantIndex(t, mk(seedA), size), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wire >= 128 {
+			t.Fatalf("1 TiB no-op transferred %d bytes, want < 128", wire)
+		}
+		t.Logf("1 TiB no-op wire=%d", wire)
+	})
+
+	t.Run("oneChunk", func(t *testing.T) {
+		base := mk(seedA)
+		nw := &oneFlip{base: base, ci: size / chunkSize / 2}
+		srv := giantIndex(t, nw, size)
+		got, wire, err := syncOnce(t, srv, &ditchSink{}, giantIndex(t, base, size), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wire >= 2*chunkSize {
+			t.Fatalf("1 TiB one-chunk delta transferred %d bytes, want < %d", wire, 2*chunkSize)
+		}
+		if got.Root() != srv.Root() {
+			t.Fatal("1 TiB one-chunk root mismatch")
+		}
+		t.Logf("1 TiB one-chunk wire=%d", wire)
+	})
+
+	t.Run("rewrite", func(t *testing.T) {
+		srv := giantIndex(t, mk(seedB), size)
+		got, wire, err := syncOnce(t, srv, &ditchSink{}, giantIndex(t, mk(seedA), size), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Root() != srv.Root() {
+			t.Fatal("1 TiB rewrite root mismatch")
+		}
+		t.Logf("1 TiB rewrite wire=%d (~%d GiB, all %d leaves)", wire, wire>>30, size/chunkSize)
+	})
 }

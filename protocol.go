@@ -29,6 +29,11 @@ const (
 
 const maxFrame = 1 << 20 // a chunk plus overhead, with room to spare
 
+// maxBatch caps the refs in one query frame and the hashes in its reply:
+// 4 + 32*maxBatch stays under maxFrame, so a descent level with a larger
+// frontier is split across multiple query/reply round-trips.
+const maxBatch = 32765
+
 type helloMsg struct {
 	size int64
 	root Hash
