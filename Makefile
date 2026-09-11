@@ -1,6 +1,6 @@
 BIN := bin/merkle
 
-.PHONY: all build test clean
+.PHONY: all build test testfull clean
 all: build
 
 build:
@@ -8,6 +8,9 @@ build:
 	go build -o $(BIN) ./cmd/merkle
 
 test:
+	go test -short ./...
+
+testfull:
 	go test ./...
 
 clean:

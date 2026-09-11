@@ -235,9 +235,11 @@ func TestIndexDeterministic(t *testing.T) {
 
 // TestIndexLazyConstruction pins AC3: NewIndex performs no I/O and
 // holds no file data; the first Root hashes the file exactly once, the
-// second is a memo hit.
+// second is a memo hit. 128 MiB fits the fast suite and is still 128x
+// the 1 MiB heap threshold; the 1 GiB scale stays in the full suite
+// via TestSyncDeltaGiant.
 func TestIndexLazyConstruction(t *testing.T) {
-	const size = int64(1) << 30 // 1 GiB
+	const size = int64(128) << 20 // 128 MiB
 	v := &virtualFile{size: size}
 	var before, after runtime.MemStats
 	runtime.GC()
@@ -253,7 +255,7 @@ func TestIndexLazyConstruction(t *testing.T) {
 		t.Fatalf("NewIndex read %d bytes, want 0", v.read)
 	}
 	if d := after.HeapAlloc - before.HeapAlloc; d >= 1<<20 {
-		t.Fatalf("constructing a 1 GiB index grew the heap by %d bytes, want < 1 MiB", d)
+		t.Fatalf("constructing a 128 MiB index grew the heap by %d bytes, want < 1 MiB", d)
 	}
 	r1 := ix.Root()
 	if r1 == (Hash{}) {
@@ -273,8 +275,13 @@ func TestIndexLazyConstruction(t *testing.T) {
 // TestSyncDeltaGiant pins AC4 at 1 GiB: the server reads its file once
 // to build the memo plus exactly the one changed chunk; the client
 // reads its file once for the memo build and nothing else; the wire
-// carries one chunk plus small descent overhead.
+// carries one chunk plus small descent overhead. Skipped under -short
+// (run via make testfull); the delta logic itself is covered at small
+// scale by TestSyncDelta.
 func TestSyncDeltaGiant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("1 GiB scale test; run without -short (make testfull)")
+	}
 	const size = int64(1) << 30
 	lo := int64(512 << 20) // one chunk, in the middle
 	old := &virtualFile{size: size}
@@ -737,10 +744,15 @@ func (f *frameCap) Write(p []byte) (int, error) {
 // TestBatchedDescent pins the batched descent at 8 GiB (2^17 leaves, so
 // the leaf frontier splits across 5 query/reply round-trips) with half
 // the chunks changed: every frame fits maxFrame and the synced file
-// matches the server's. Sized to stay inside the default -race test
-// timeout for the normal suite; the terabyte frontier is covered by
-// TestGiant (behind -short), and 64 GiB was verified the same way.
+// matches the server's. Skipped under -short (run via make testfull):
+// the frontier must span more than maxBatch (32765) leaves to split
+// across round-trips, so 8 GiB is near the minimum scale and cannot fit
+// the fast suite; the terabyte frontier is covered by TestGiant, and
+// 64 GiB was verified the same way.
 func TestBatchedDescent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("8 GiB scale test; run without -short (make testfull)")
+	}
 	const size = int64(8) << 30
 	old := &virtualFile{size: size}
 	nw := &maskedFile{virtualFile: virtualFile{size: size}}

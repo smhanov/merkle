@@ -125,6 +125,7 @@ func TestFolderPushSSH(t *testing.T) {
 	if !sshOK {
 		t.Skip("loopback ssh unavailable")
 	}
+	t.Parallel()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	remote := filepath.Join(dir, "remote")

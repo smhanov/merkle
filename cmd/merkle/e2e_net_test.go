@@ -162,6 +162,7 @@ func TestSSHPush(t *testing.T) {
 	if !sshOK {
 		t.Skip("loopback ssh unavailable")
 	}
+	t.Parallel()
 	dir := t.TempDir()
 	local := filepath.Join(dir, "local.txt")
 	writeChunkedFile(t, local, 200000, 7) // 4 chunks of 64 KiB
@@ -222,6 +223,7 @@ func TestSSHPull(t *testing.T) {
 	if !sshOK {
 		t.Skip("loopback ssh unavailable")
 	}
+	t.Parallel()
 	dir := t.TempDir()
 	remote := filepath.Join(dir, "remote-src.txt")
 	writeChunkedFile(t, remote, 200000, 7) // 4 chunks of 64 KiB

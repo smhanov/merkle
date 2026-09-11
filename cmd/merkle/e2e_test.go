@@ -348,6 +348,7 @@ func TestFailures(t *testing.T) {
 		if !sshOK {
 			t.Skip("ssh unavailable")
 		}
+		t.Parallel()
 		writeChunkedFile(t, filepath.Join(dir, "a.txt"), 1000, 1)
 		out, errOut, exit := runMerkle(t, dir, "a.txt", "127.0.0.1:"+dir+"/remote-absent.txt")
 		if exit == 0 {
