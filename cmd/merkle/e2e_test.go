@@ -252,6 +252,58 @@ func TestLocalSync(t *testing.T) {
 	})
 }
 
+// TestFileIntoDirectory pins `merkle <file> <dir>` (a local file whose
+// destination is a directory): the file is copied into the directory
+// under its own basename, like cp <file> <dir>/.
+func TestFileIntoDirectory(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	if err := os.MkdirAll(filepath.Join(dir, "destdir"), 0755); err != nil {
+		t.Fatalf("mkdir destdir: %v", err)
+	}
+	target := filepath.Join(dir, "destdir", "src.txt")
+	writeChunkedFile(t, src, 200000, 7) // 4 chunks of 64 KiB
+
+	t.Run("fresh", func(t *testing.T) {
+		out, errOut, exit := runMerkle(t, dir, "src.txt", "destdir")
+		if exit != 0 {
+			t.Fatalf("exit %d, stderr: %q", exit, errOut)
+		}
+		for _, want := range []string{
+			"src.txt -> destdir/src.txt:",
+			"bytes transferred",
+			"4 of 4 chunks changed",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("want %q in output, got: %q", want, out)
+			}
+		}
+		assertFilesEqual(t, src, target)
+	})
+
+	t.Run("no-op", func(t *testing.T) {
+		out, errOut, exit := runMerkle(t, dir, "src.txt", "destdir")
+		if exit != 0 {
+			t.Fatalf("exit %d, stderr: %q", exit, errOut)
+		}
+		if !strings.Contains(out, "src.txt -> destdir/src.txt: up to date") {
+			t.Fatalf("want up-to-date line, got: %q", out)
+		}
+	})
+
+	t.Run("delta", func(t *testing.T) {
+		flipByte(t, src, 100000) // inside chunk 1
+		out, errOut, exit := runMerkle(t, dir, "src.txt", "destdir")
+		if exit != 0 {
+			t.Fatalf("exit %d, stderr: %q", exit, errOut)
+		}
+		if !strings.Contains(out, "1 of 4 chunks changed") {
+			t.Fatalf("want 1-of-4 delta line, got: %q", out)
+		}
+		assertFilesEqual(t, src, target)
+	})
+}
+
 func TestFailures(t *testing.T) {
 	dir := t.TempDir()
 

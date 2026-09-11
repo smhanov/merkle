@@ -1097,7 +1097,11 @@ func main() {
 		}
 	case dstIsDir:
 		if src.kind == kindLocal {
-			fail(fmt.Errorf("merkle: src %q is a file but dst is a directory", src.path))
+			// A file into a directory: copy it in under its own
+			// basename, like cp <file> <dir>/.
+			target := filepath.Join(dst.path, filepath.Base(src.path))
+			oneShotLocal(srcArg, target, src, spec{kind: kindLocal, path: target})
+			return
 		}
 		fail(fmt.Errorf("merkle: pulling a remote folder (%s) is not supported in v1", srcArg))
 	case src.kind == kindLocal && dst.kind == kindLocal:
