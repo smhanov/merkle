@@ -27,7 +27,7 @@ smallest subtree that contains it.
 ### The sync
 
 One session runs over any bidirectional byte channel — a TCP connection,
-an in-memory pipe, or the two chunked bodies of an HTTP request:
+an in-memory pipe:
 
 1. The client sends the size and root of its local file (a zero root if
    the file is absent).
@@ -99,23 +99,6 @@ newIx, err := merkle.Pull(conn, file, prior)
 `*os.File` satisfies both `io.ReaderAt` (indexing) and `merkle.Sink`
 (the client write target). If the file is unchanged, `Pull` returns the
 prior index and leaves the file untouched.
-
-### Over HTTP
-
-The `httpbridge` subpackage runs the same session inside an ordinary HTTP
-request/response, for endpoints that only speak HTTP (behind a reverse
-proxy or CDN, or a plain web server):
-
-```go
-mux := http.NewServeMux()
-mux.Handle("/sync", httpbridge.NewHandler(ix)) // server
-
-newIx, err := httpbridge.Pull("https://example.com/sync", file, prior) // client
-```
-
-The request and response bodies are streamed with chunked transfer in both
-directions — a sync is a request/reply ping-pong, so the two must be
-concurrent. The endpoint must not buffer the request body.
 
 ## The `merkle` CLI
 
