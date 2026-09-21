@@ -992,3 +992,96 @@ func TestGiant(t *testing.T) {
 		t.Logf("1 TiB rewrite wire=%d (~%d GiB, all %d leaves)", wire, wire>>30, size/chunkSize)
 	})
 }
+
+// warmFile writes size bytes of deterministic content to a temp file
+// and returns it plus an Index over it. The index and file are closed
+// at test end.
+func warmFile(t *testing.T, size int64) (*os.File, *Index) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "warm-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	if _, err := f.Write(pattern(int(size))); err != nil {
+		t.Fatal(err)
+	}
+	ix, err := NewIndex(f, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ix.Close() })
+	return f, ix
+}
+
+func TestWarm(t *testing.T) {
+	// 100 full chunks plus a partial one: exercises parallel leaf
+	// ranges, batched memo writes, promoted nodes, and the short
+	// final leaf.
+	const size = 100*chunkSize + 12345
+	_, want := warmFile(t, size)
+	ref := want.Root() // lazy path, before Warm
+
+	_, ix := warmFile(t, size)
+	if err := ix.Warm(); err != nil {
+		t.Fatal(err)
+	}
+	if ix.Root() != ref {
+		t.Fatal("warm root differs from lazy root")
+	}
+	// Warm again: the memoized root makes it a no-op.
+	if err := ix.Warm(); err != nil {
+		t.Fatal(err)
+	}
+	if ix.Root() != ref {
+		t.Fatal("root changed after second Warm")
+	}
+}
+
+func TestWarmThenSync(t *testing.T) {
+	dir := t.TempDir()
+	mkFile := func(name string, size int) *os.File {
+		f, err := os.CreateTemp(dir, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		if _, err := f.Write(pattern(size)); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	// Both sides warm: a no-op sync and a delta sync must both work.
+	sf := mkFile("srv-*", 50*chunkSize+7)
+	srv, err := NewIndex(sf, int64(50*chunkSize+7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	if err := srv.Warm(); err != nil {
+		t.Fatal(err)
+	}
+
+	pf := mkFile("prior-*", 50*chunkSize+7)
+	prior, err := NewIndex(pf, int64(50*chunkSize+7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { prior.Close() })
+	if err := prior.Warm(); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := &memSink{data: pattern(50*chunkSize + 7)}
+	got, _, err := syncOnce(t, srv, dst, prior, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Root() != srv.Root() {
+		t.Fatal("warm sync root mismatch")
+	}
+	if !bytes.Equal(dst.data, pattern(50*chunkSize+7)) {
+		t.Fatal("warm sync content mismatch")
+	}
+}
