@@ -41,8 +41,12 @@ func Serve(rw io.ReadWriter, ix *Index) error {
 	}
 
 	var changed []int
-	if hello.size != ix.size || hello.root == (Hash{}) {
-		// No file, or a different shape: send everything.
+	if hello.root == (Hash{}) {
+		// No client file: send everything. A size mismatch alone is not
+		// a reason to skip the delta: chunks sit on a fixed 64KiB grid,
+		// so an append-only file keeps every existing chunk, and ranges
+		// the client lacks hash to zero in the descent, so they are
+		// sent in full. apply resizes dst as needed.
 		changed = make([]int, ix.levels[0].n)
 		for i := range changed {
 			changed[i] = i
