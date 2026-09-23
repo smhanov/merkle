@@ -30,6 +30,23 @@ func Serve(rw io.ReadWriter, ix *Index) error {
 		return err
 	}
 
+	// Honor the client's chunk size: rebuild the index on the
+	// requested grid and warm it before descending. The rebuilt
+	// index is closed here; the caller's defer still points at the
+	// original, whose Close is idempotent.
+	if hello.chunk != ix.chunkSize() {
+		re, err := NewIndexChunked(ix.r, ix.size, hello.chunk)
+		if err != nil {
+			return err
+		}
+		defer re.Close()
+		if err := re.Warm(); err != nil {
+			return err
+		}
+		ix.Close()
+		ix = re
+	}
+
 	root, err := ix.root()
 	if err != nil {
 		return err
@@ -97,7 +114,7 @@ func Pull(rw io.ReadWriter, dst Sink, prior *Index) (*Index, error) {
 	if prior == nil {
 		prior = &Index{} // absent file: zero size, zero root
 	}
-	if err := writeMsg(rw, msgHello, encodeHello(helloMsg{size: prior.size, root: prior.Root()})); err != nil {
+	if err := writeMsg(rw, msgHello, encodeHello(helloMsg{size: prior.size, root: prior.Root(), chunk: prior.chunk})); err != nil {
 		return nil, err
 	}
 	for {
@@ -249,13 +266,14 @@ func apply(rw io.ReadWriter, dst Sink, prior *Index, ack ackMsg) (*Index, error)
 		if err != nil {
 			return nil, err
 		}
+		chunk := prior.chunkSize()
 		if hash(m.data) != m.hash {
 			return nil, ErrMismatch
 		}
-		if m.off%chunkSize != 0 {
+		if m.off%chunk != 0 {
 			return nil, ErrProtocol
 		}
-		li := int(m.off / chunkSize)
+		li := int(m.off / chunk)
 		if li >= prior.levels[0].n {
 			return nil, ErrProtocol
 		}

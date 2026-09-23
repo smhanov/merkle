@@ -2,7 +2,8 @@
 // using a chunked merkle tree.
 //
 // Indexing: NewIndex returns an Index over an io.ReaderAt of the given
-// size: a SHA-256 merkle tree over fixed 64 KiB chunks. The Index never
+// size: a SHA-256 merkle tree over fixed-size chunks (64 KiB by
+// default, negotiable per sync — see NewIndexChunked). The Index never
 // holds the file's bytes: it reads them only when a hash or a chunk
 // needs them, and memoizes computed hashes in a temp file that Close
 // removes. Its Root changes when any byte of the file changes —
@@ -20,7 +21,9 @@
 //     each verified by hash on arrival;
 //   - a missing local file transfers the whole file, chunk by chunk.
 //
-// Chunking and hashing are fixed (64 KiB, SHA-256): there is nothing to
-// configure. Peers running different versions of the package degrade
-// gracefully to a full transfer.
+// Chunking and hashing are fixed (SHA-256); the chunk size is 64 KiB
+// unless a peer negotiates another size in the hello (see
+// NewIndexChunked). A peer running an older version of the package
+// keeps the 64 KiB grid: the server re-chunks to whatever the client
+// asks, so mixed versions still sync correctly.
 package merkle

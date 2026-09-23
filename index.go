@@ -11,15 +11,28 @@ import (
 // The zero Hash identifies the empty file.
 type Hash [32]byte
 
-// chunkSize is the fixed leaf size. Peers run the same package, so they
-// always chunk identically; a version skew changes the tree shape and
-// degrades a sync to a full transfer.
+// chunkSize is the default fixed leaf size. Peers must chunk
+// identically for their trees to line up; the hello carries the
+// client's chunk size, so a server built with the default re-chunks
+// itself when a peer asks for something else. A version skew that
+// changes the policy on one side only degrades that file's sync to a
+// full transfer or fails loudly at the handshake, never silently.
 const chunkSize = 64 << 10
+
+// DefaultChunkSize is the leaf size used by NewIndex.
+const DefaultChunkSize = chunkSize
+
+// minChunkSize and maxChunkSize bound NewIndexChunked. The upper bound
+// keeps Warm's 4 MiB read block at least one whole chunk.
+const (
+	minChunkSize = 512
+	maxChunkSize = 4 << 20
+)
 
 // Index is the chunked merkle index of a file. It never holds the
 // file's bytes: it reads them on demand from its io.ReaderAt and
-// memoizes computed hashes in a temp file. Build one with NewIndex and
-// release it with Close.
+// memoizes computed hashes in a temp file. Build one with NewIndex or
+// NewIndexChunked and release it with Close.
 type Index struct {
 	size   int64
 	r      io.ReaderAt
@@ -27,6 +40,7 @@ type Index struct {
 	levels []levelMeta
 	buf    []byte
 	closed bool
+	chunk  int64
 }
 
 // levelMeta holds the node count of one tree level and the byte offset
@@ -37,10 +51,14 @@ type levelMeta struct {
 }
 
 // treeMeta computes the per-level node counts, memo offsets, and total
-// memo size for a file of the given size: n_0 = ceil(size/chunkSize),
-// n_{k+1} = ceil(n_k/2), up to the single root.
-func treeMeta(size int64) (levels []levelMeta, total int64) {
-	n := (size + chunkSize - 1) / chunkSize
+// memo size for a file of the given size: n_0 = ceil(size/chunk),
+// n_{k+1} = ceil(n_k/2), up to the single root. A chunk <= 0 normalizes
+// to the default.
+func treeMeta(size, chunk int64) (levels []levelMeta, total int64) {
+	if chunk <= 0 {
+		chunk = chunkSize
+	}
+	n := (size + chunk - 1) / chunk
 	for n > 0 {
 		levels = append(levels, levelMeta{n: int(n)})
 		if n == 1 {
@@ -56,15 +74,26 @@ func treeMeta(size int64) (levels []levelMeta, total int64) {
 	return levels, 32 * sum
 }
 
-// NewIndex returns the index of a size-byte file readable from r. It
-// performs no I/O: the file is read only when a hash or a chunk needs
-// it, and computed hashes are memoized in a temp file. Call Close to
-// remove it.
+// NewIndex returns the index of a size-byte file readable from r,
+// chunked at DefaultChunkSize. It performs no I/O: the file is read
+// only when a hash or a chunk needs it, and computed hashes are
+// memoized in a temp file. Call Close to remove it.
 func NewIndex(r io.ReaderAt, size int64) (*Index, error) {
+	return NewIndexChunked(r, size, DefaultChunkSize)
+}
+
+// NewIndexChunked is NewIndex with an explicit leaf size. Both peers
+// of a sync must use the same chunk size for their trees to line up;
+// the protocol negotiates this through the hello, and the server side
+// re-chunks its index when the client asks for a different size.
+func NewIndexChunked(r io.ReaderAt, size int64, chunk int64) (*Index, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("merkle: negative size %d", size)
 	}
-	levels, total := treeMeta(size)
+	if chunk < minChunkSize || chunk > maxChunkSize {
+		return nil, fmt.Errorf("merkle: chunk size %d out of range [%d, %d]", chunk, minChunkSize, maxChunkSize)
+	}
+	levels, total := treeMeta(size, chunk)
 	f, err := os.CreateTemp("", "merkle-*")
 	if err != nil {
 		return nil, err
@@ -79,7 +108,8 @@ func NewIndex(r io.ReaderAt, size int64) (*Index, error) {
 		r:      r,
 		memo:   f,
 		levels: levels,
-		buf:    make([]byte, chunkSize),
+		buf:    make([]byte, chunk),
+		chunk:  chunk,
 	}, nil
 }
 
@@ -115,14 +145,24 @@ func (ix *Index) Size() int64 {
 }
 
 // rangeOf returns the byte range [off, off+size) of the node
-// (level, index). Every node boundary is a multiple of chunkSize; a
-// promoted (single-child) node covers exactly its child's range, which
-// is why the span is capped by the file end.
+// (level, index). Every node boundary is a multiple of the chunk
+// size; a promoted (single-child) node covers exactly its child's
+// range, which is why the span is capped by the file end.
 func (ix *Index) rangeOf(lvl, i int) (off, size int64) {
-	w := int64(1) << uint(lvl) * chunkSize
+	chunk := ix.chunkSize()
+	w := int64(1) << uint(lvl) * chunk
 	off = int64(i) * w
 	size = min(w, ix.size-off)
 	return off, size
+}
+
+// chunkSize returns the index's leaf size, defaulting when unset (a
+// zero-value Index from Pull with no local file).
+func (ix *Index) chunkSize() int64 {
+	if ix.chunk <= 0 {
+		return DefaultChunkSize
+	}
+	return ix.chunk
 }
 
 // nodeForRange resolves a byte range to (level, index): the smallest
@@ -130,11 +170,12 @@ func (ix *Index) rangeOf(lvl, i int) (off, size int64) {
 // promoted node and its child resolves to either level; both carry the
 // same hash, so the answer is unique.
 func (ix *Index) nodeForRange(off, size int64) (int, int, bool) {
-	if size < 0 || off < 0 || off+size > ix.size || off%chunkSize != 0 {
+	chunk := ix.chunkSize()
+	if size < 0 || off < 0 || off+size > ix.size || off%chunk != 0 {
 		return 0, 0, false
 	}
 	for l := 0; l < len(ix.levels); l++ {
-		w := int64(1) << uint(l) * chunkSize
+		w := int64(1) << uint(l) * chunk
 		if off%w != 0 {
 			continue
 		}
@@ -272,7 +313,7 @@ func (ix *Index) computeAllLevels() error {
 // setLayout adopts a new file size: it resizes the memo to the new
 // level layout (all entries zero) and updates the shape arithmetic.
 func (ix *Index) setLayout(size int64) error {
-	levels, total := treeMeta(size)
+	levels, total := treeMeta(size, ix.chunk)
 	if ix.memo == nil {
 		f, err := os.CreateTemp("", "merkle-*")
 		if err != nil {

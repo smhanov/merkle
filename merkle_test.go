@@ -377,6 +377,126 @@ func TestSyncDelta(t *testing.T) {
 	}
 }
 
+func TestSyncChunked(t *testing.T) {
+	const chunk = 4096
+	const pages = 800 // ~3.1 MiB, 16 pages per 64 KiB
+	old := pattern(pages * chunk)
+	nw := append([]byte(nil), old...)
+	// change two scattered pages, as a SQLite day of writes would
+	for _, pg := range []int{17, 599} {
+		for i := pg * chunk; i < (pg+1)*chunk; i++ {
+			nw[i] ^= 0x5A
+		}
+	}
+	// and append two pages, as a day of new rows would
+	nw = append(nw, pattern(2*chunk)...)
+
+	srv, err := NewIndexChunked(bytes.NewReader(nw), int64(len(nw)), chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior, err := NewIndexChunked(bytes.NewReader(old), int64(len(old)), chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &memSink{data: append([]byte(nil), old...)}
+	got, wire, err := syncOnce(t, srv, sink, prior, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sink.data, nw) {
+		t.Fatal("chunked delta sync produced wrong content")
+	}
+	if got.Root() != srv.Root() {
+		t.Fatal("chunked delta root mismatch")
+	}
+	// 4 changed pages + framing must stay far below the old 64 KiB
+	// grid, which would have resent 3 whole 64 KiB chunks (~196 KB).
+	if wire >= 8*chunk {
+		t.Fatalf("chunked delta transferred %d bytes, want < %d", wire, 8*chunk)
+	}
+}
+
+func TestSyncChunkNegotiation(t *testing.T) {
+	const chunk = 4096
+	data := pattern(300 * chunk)
+
+	t.Run("server default, client chunked", func(t *testing.T) {
+		srv, err := NewIndex(bytes.NewReader(data), int64(len(data))) // default grid
+		if err != nil {
+			t.Fatal(err)
+		}
+		prior, err := NewIndexChunked(bytes.NewReader(nil), 0, chunk) // absent file, 4 KiB grid
+		if err != nil {
+			t.Fatal(err)
+		}
+		sink := &memSink{}
+		got, _, err := syncOnce(t, srv, sink, prior, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(sink.data, data) {
+			t.Fatal("negotiated full sync produced wrong content")
+		}
+		// The pulled root lives on the client's 4 KiB grid, so it
+		// differs from srv's; compare against a 4 KiB-grid index.
+		want, err := NewIndexChunked(bytes.NewReader(data), int64(len(data)), chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer want.Close()
+		if got.Root() != want.Root() {
+			t.Fatal("negotiated full sync root mismatch")
+		}
+	})
+
+	t.Run("server chunked, client default", func(t *testing.T) {
+		srv, err := NewIndexChunked(bytes.NewReader(data), int64(len(data)), chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := pattern(100 * chunk)
+		prior, err := NewIndex(bytes.NewReader(old), int64(len(old))) // default grid
+		if err != nil {
+			t.Fatal(err)
+		}
+		sink := &memSink{data: append([]byte(nil), old...)}
+		got, _, err := syncOnce(t, srv, sink, prior, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(sink.data, data) {
+			t.Fatal("negotiated delta sync produced wrong content")
+		}
+		// The pulled root lives on the client's default grid, so it
+		// differs from srv's; compare against a default-grid index.
+		want, err := NewIndex(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer want.Close()
+		if got.Root() != want.Root() {
+			t.Fatal("negotiated delta sync root mismatch")
+		}
+	})
+}
+
+func TestNewIndexChunkedValidation(t *testing.T) {
+	r := bytes.NewReader(nil)
+	for _, chunk := range []int64{0, -1, 511, maxChunkSize + 1} {
+		if _, err := NewIndexChunked(r, 0, chunk); err == nil {
+			t.Fatalf("chunk %d: want error, got nil", chunk)
+		}
+	}
+	for _, chunk := range []int64{512, 4096, chunkSize, maxChunkSize} {
+		ix, err := NewIndexChunked(r, 0, chunk)
+		if err != nil {
+			t.Fatalf("chunk %d: unexpected error %v", chunk, err)
+		}
+		ix.Close()
+	}
+}
+
 func TestSyncFromScratch(t *testing.T) {
 	data := pattern(3 * chunkSize)
 	srv, err := NewIndex(bytes.NewReader(data), int64(len(data)))
@@ -625,7 +745,7 @@ func TestPublicSurface(t *testing.T) {
 			}
 		}
 	}
-	want := []string{"ErrMismatch", "ErrProtocol", "Hash", "Index", "NewIndex", "Pull", "Serve", "Sink"}
+	want := []string{"ErrMismatch", "ErrProtocol", "Hash", "Index", "NewIndex", "NewIndexChunked", "Pull", "Serve", "Sink", "DefaultChunkSize"}
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("missing exported symbol %q", w)

@@ -8,7 +8,7 @@ import (
 // The sync protocol. One session per call to Serve/Pull, over a
 // bidirectional byte channel:
 //
-//	client: hello{size,root}
+//	client: hello{size,root[,chunk]}
 //	server: query{refs}  → client: reply{hashes}   (repeated: the descent)
 //	server: ack{match,leaves,root,size}
 //	server: leaf{off,hash,data} × leaves
@@ -16,6 +16,9 @@ import (
 // A size mismatch or a zero client root skips the descent (full
 // transfer). A matching root yields an ack alone. Framing is 1 byte
 // type + 4 byte big-endian length + payload, in both directions.
+// The hello is 40 bytes; a client that wants a non-default chunk size
+// appends 8 bytes carrying it, and the server re-chunks its index to
+// match before the descent.
 
 type msgType uint8
 
@@ -35,8 +38,9 @@ const maxFrame = 1 << 20 // a chunk plus overhead, with room to spare
 const maxBatch = 32765
 
 type helloMsg struct {
-	size int64
-	root Hash
+	size  int64
+	root  Hash
+	chunk int64 // 0 or DefaultChunkSize encodes as the classic 40-byte hello
 }
 
 // ref names a subtree by the byte range it covers. Both peers share
@@ -92,20 +96,41 @@ func readMsg(r io.Reader) (msgType, []byte, error) {
 }
 
 func encodeHello(m helloMsg) []byte {
-	p := make([]byte, 8+32)
+	if m.chunk <= 0 || m.chunk == DefaultChunkSize {
+		p := make([]byte, 8+32)
+		binary.BigEndian.PutUint64(p[0:8], uint64(m.size))
+		copy(p[8:], m.root[:])
+		return p
+	}
+	p := make([]byte, 8+32+8)
 	binary.BigEndian.PutUint64(p[0:8], uint64(m.size))
 	copy(p[8:], m.root[:])
+	binary.BigEndian.PutUint64(p[40:48], uint64(m.chunk))
 	return p
 }
 
 func decodeHello(p []byte) (helloMsg, error) {
-	if len(p) != 8+32 {
+	switch len(p) {
+	case 8 + 32:
+		// Classic hello: the peer wants the default grid.
+		return helloMsg{
+			size:  int64(binary.BigEndian.Uint64(p[0:8])),
+			root:  Hash(p[8 : 8+32]),
+			chunk: DefaultChunkSize,
+		}, nil
+	case 8 + 32 + 8:
+		m := helloMsg{
+			size:  int64(binary.BigEndian.Uint64(p[0:8])),
+			root:  Hash(p[8 : 8+32]),
+			chunk: int64(binary.BigEndian.Uint64(p[40:48])),
+		}
+		if m.chunk <= 0 {
+			return helloMsg{}, ErrProtocol
+		}
+		return m, nil
+	default:
 		return helloMsg{}, ErrProtocol
 	}
-	return helloMsg{
-		size: int64(binary.BigEndian.Uint64(p[0:8])),
-		root: Hash(p[8 : 8+32]),
-	}, nil
 }
 
 func encodeQuery(m queryMsg) []byte {

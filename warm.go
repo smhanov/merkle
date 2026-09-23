@@ -43,8 +43,11 @@ const (
 func (ix *Index) warmLeaves() error {
 	n := ix.levels[0].n
 	leafOff := ix.levels[0].off
+	chunk := ix.chunkSize()
 	return parallelRanges(n, func(lo, hi int) error {
-		block := make([]byte, min(int64(warmReadBlock), int64(hi-lo)*chunkSize))
+		span := min(int64(warmReadBlock), int64(hi-lo)*chunk)
+		span = span / chunk * chunk // whole chunks, so blocks stay chunk-aligned
+		block := make([]byte, span)
 		batch := make([]byte, 0, 32*warmBatch)
 		first := lo // leaf index of batch[0]
 		off, _ := ix.rangeOf(0, lo)
@@ -67,12 +70,12 @@ func (ix *Index) warmLeaves() error {
 			if err != nil && err != io.EOF {
 				return err
 			}
-			for p := 0; p < got; p += chunkSize {
-				li := int(off/chunkSize) + p/chunkSize
+			for p := 0; p < got; p += int(chunk) {
+				li := int(off/chunk) + p/int(chunk)
 				if li >= hi {
 					break
 				}
-				h := hash(block[p:min(p+chunkSize, got)])
+				h := hash(block[p:min(p+int(chunk), got)])
 				batch = append(batch, h[:]...)
 				if len(batch) == cap(batch) {
 					if err := flush(li + 1); err != nil {
